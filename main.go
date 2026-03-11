@@ -319,6 +319,7 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, cfg Config, cq *tgbotapi.C
 
 	invite, err := createInviteLink(bot, cfg.ChannelID, time.Now().Add(10*time.Minute))
 	if err != nil {
+		log.Printf("create invite link failed: %v", err)
 		answer := tgbotapi.NewCallback(cq.ID, "Failed to create invite link.")
 		_, _ = bot.Request(answer)
 		return
@@ -401,3 +402,4 @@ func broadcast(bot *tgbotapi.BotAPI, ids []int64, text string) int {
 func isAdmin(cfg Config, userID int64) bool {
 	return cfg.AdminIDs[userID]
 }
+
