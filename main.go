@@ -16,8 +16,21 @@ import (
 )
 
 const (
-	defaultTrialMinutes = 5
+	defaultTrialMinutes = 1
 	defaultDbPath       = "data.db"
+
+	defaultWelcomeMessage = "Hello! Try free access for 5 minutes."
+	defaultPaymentMessage = "Payment with cryptocurrency for lifetime access. Contact"
+	defaultLinkMessage    = "Invite link is valid for 5 minutes."
+
+	inviteTTLMinutes    = 5
+	inviteCooldownHours = 24
+)
+
+const (
+	settingsKeyWelcome = "welcome_message"
+	settingsKeyPayment = "payment_message"
+	settingsKeyLink    = "link_message"
 )
 
 type Config struct {
@@ -26,6 +39,17 @@ type Config struct {
 	AdminIDs     map[int64]bool
 	TrialMinutes int
 	DbPath       string
+}
+
+type Trial struct {
+	UserID        int64
+	InviteCreated int64
+	InviteExpires int64
+	InviteLink    string
+	CooldownUntil int64
+	StartedAt     int64
+	EndsAt        int64
+	EndedAt       sql.NullInt64
 }
 
 func loadConfig() (Config, error) {
@@ -92,10 +116,18 @@ func ensureSchema(db *sql.DB) error {
 		);`,
 		`CREATE TABLE IF NOT EXISTS trials (
 			user_id INTEGER PRIMARY KEY,
+			invite_created_at INTEGER NOT NULL,
+			invite_expires_at INTEGER NOT NULL,
+			invite_link TEXT NOT NULL DEFAULT '',
+			cooldown_until INTEGER NOT NULL,
 			started_at INTEGER NOT NULL,
 			ends_at INTEGER NOT NULL,
 			ended_at INTEGER,
 			FOREIGN KEY(user_id) REFERENCES users(user_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
 		);`,
 	}
 
@@ -103,6 +135,38 @@ func ensureSchema(db *sql.DB) error {
 		if _, err := db.Exec(q); err != nil {
 			return err
 		}
+	}
+
+	// Migrations for older DBs
+	_ = addColumnIfMissing(db, "trials", "invite_created_at", "INTEGER NOT NULL DEFAULT 0")
+	_ = addColumnIfMissing(db, "trials", "invite_expires_at", "INTEGER NOT NULL DEFAULT 0")
+	_ = addColumnIfMissing(db, "trials", "invite_link", "TEXT NOT NULL DEFAULT ''")
+	_ = addColumnIfMissing(db, "trials", "cooldown_until", "INTEGER NOT NULL DEFAULT 0")
+	_ = addColumnIfMissing(db, "trials", "started_at", "INTEGER NOT NULL DEFAULT 0")
+	_ = addColumnIfMissing(db, "trials", "ends_at", "INTEGER NOT NULL DEFAULT 0")
+
+	return seedDefaults(db)
+}
+
+func addColumnIfMissing(db *sql.DB, table, column, def string) error {
+	stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, def)
+	if _, err := db.Exec(stmt); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") && !strings.Contains(err.Error(), "already exists") {
+			return err
+		}
+	}
+	return nil
+}
+
+func seedDefaults(db *sql.DB) error {
+	if err := setSettingIfMissing(db, settingsKeyWelcome, defaultWelcomeMessage); err != nil {
+		return err
+	}
+	if err := setSettingIfMissing(db, settingsKeyPayment, defaultPaymentMessage); err != nil {
+		return err
+	}
+	if err := setSettingIfMissing(db, settingsKeyLink, defaultLinkMessage); err != nil {
+		return err
 	}
 	return nil
 }
@@ -121,27 +185,73 @@ func upsertUser(db *sql.DB, u *tgbotapi.User) error {
 	return err
 }
 
-func hasTrial(db *sql.DB, userID int64) (bool, error) {
-	var count int
-	if err := db.QueryRow(`SELECT COUNT(1) FROM trials WHERE user_id = ?`, userID).Scan(&count); err != nil {
-		return false, err
-	}
-	return count > 0, nil
+func setSettingIfMissing(db *sql.DB, key, value string) error {
+	_, err := db.Exec(`INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING`, key, value)
+	return err
 }
 
-func createTrial(db *sql.DB, userID int64, duration time.Duration) (time.Time, error) {
-	start := time.Now()
-	end := start.Add(duration)
+func getSetting(db *sql.DB, key, fallback string) (string, error) {
+	var value string
+	err := db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fallback, nil
+		}
+		return fallback, err
+	}
+	if strings.TrimSpace(value) == "" {
+		return fallback, nil
+	}
+	return value, nil
+}
+
+func setSetting(db *sql.DB, key, value string) error {
+	_, err := db.Exec(`INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	return err
+}
+
+func getTrial(db *sql.DB, userID int64) (*Trial, error) {
+	row := db.QueryRow(`SELECT user_id, invite_created_at, invite_expires_at, invite_link, cooldown_until, started_at, ends_at, ended_at FROM trials WHERE user_id = ?`, userID)
+	var t Trial
+	if err := row.Scan(&t.UserID, &t.InviteCreated, &t.InviteExpires, &t.InviteLink, &t.CooldownUntil, &t.StartedAt, &t.EndsAt, &t.EndedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &t, nil
+}
+
+func upsertTrialStarted(db *sql.DB, userID int64, inviteExpires time.Time, cooldownUntil time.Time, endsAt time.Time) error {
+	now := time.Now().Unix()
 	_, err := db.Exec(
-		`INSERT INTO trials (user_id, started_at, ends_at, ended_at)
-		 VALUES (?, ?, ?, NULL)`,
-		userID, start.Unix(), end.Unix(),
+		`INSERT INTO trials (user_id, invite_created_at, invite_expires_at, invite_link, cooldown_until, started_at, ends_at, ended_at)
+		 VALUES (?, ?, ?, '', ?, ?, ?, NULL)
+		 ON CONFLICT(user_id) DO UPDATE SET
+			invite_created_at=excluded.invite_created_at,
+			invite_expires_at=excluded.invite_expires_at,
+			invite_link=excluded.invite_link,
+			cooldown_until=excluded.cooldown_until,
+			started_at=excluded.started_at,
+			ends_at=excluded.ends_at,
+			ended_at=NULL`,
+		userID, now, inviteExpires.Unix(), cooldownUntil.Unix(), now, endsAt.Unix(),
 	)
-	return end, err
+	return err
+}
+
+func setInviteLink(db *sql.DB, userID int64, link string) error {
+	_, err := db.Exec(`UPDATE trials SET invite_link = ? WHERE user_id = ?`, link, userID)
+	return err
 }
 
 func markTrialEnded(db *sql.DB, userID int64) error {
 	_, err := db.Exec(`UPDATE trials SET ended_at = ? WHERE user_id = ? AND ended_at IS NULL`, time.Now().Unix(), userID)
+	return err
+}
+
+func clearTrials(db *sql.DB) error {
+	_, err := db.Exec(`DELETE FROM trials`)
 	return err
 }
 
@@ -181,6 +291,28 @@ func listTrialUsers(db *sql.DB) ([]int64, error) {
 	return ids, rows.Err()
 }
 
+func stats(db *sql.DB) (totalUsers int, totalLinks int, todayLinks int, weekLinks int, err error) {
+	if err = db.QueryRow(`SELECT COUNT(1) FROM users`).Scan(&totalUsers); err != nil {
+		return
+	}
+	if err = db.QueryRow(`SELECT COUNT(1) FROM trials`).Scan(&totalLinks); err != nil {
+		return
+	}
+
+	now := time.Now()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).Unix()
+	weekStart := now.Add(-7 * 24 * time.Hour).Unix()
+
+	if err = db.QueryRow(`SELECT COUNT(1) FROM trials WHERE invite_created_at >= ?`, todayStart).Scan(&todayLinks); err != nil {
+		return
+	}
+	if err = db.QueryRow(`SELECT COUNT(1) FROM trials WHERE invite_created_at >= ?`, weekStart).Scan(&weekLinks); err != nil {
+		return
+	}
+
+	return
+}
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -192,6 +324,12 @@ func main() {
 		log.Fatalf("db open error: %v", err)
 	}
 	defer db.Close()
+	// SQLite is sensitive to concurrent writers; keep a single connection and set busy timeout.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`); err != nil {
+		log.Fatalf("db pragma error: %v", err)
+	}
 
 	if err := ensureSchema(db); err != nil {
 		log.Fatalf("db schema error: %v", err)
@@ -238,13 +376,22 @@ func handleMessage(bot *tgbotapi.BotAPI, db *sql.DB, cfg Config, msg *tgbotapi.M
 }
 
 func handleCommand(bot *tgbotapi.BotAPI, db *sql.DB, cfg Config, msg *tgbotapi.Message) {
-	cmd := msg.Command()
-	switch cmd {
+	switch msg.Command() {
 	case "start":
 		_ = upsertUser(db, msg.From)
-		text := "Welcome! Tap the button below to get free 5 minutes access."
-		btn := tgbotapi.NewInlineKeyboardButtonData("Join Free 5 min", "trial_start")
-		kb := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btn))
+		sendLogToAdmins(bot, cfg, fmt.Sprintf("user started bot user=%d", msg.From.ID))
+
+		text, err := getSetting(db, settingsKeyWelcome, defaultWelcomeMessage)
+		if err != nil {
+			text = defaultWelcomeMessage
+		}
+
+		btnTrial := tgbotapi.NewInlineKeyboardButtonData("Join Free", "trial_start")
+		btnAccess := tgbotapi.NewInlineKeyboardButtonData("Get Access", "get_access")
+		kb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(btnTrial),
+			tgbotapi.NewInlineKeyboardRow(btnAccess),
+		)
 		reply := tgbotapi.NewMessage(msg.Chat.ID, text)
 		reply.ReplyMarkup = kb
 		_, _ = bot.Send(reply)
@@ -280,6 +427,103 @@ func handleCommand(bot *tgbotapi.BotAPI, db *sql.DB, cfg Config, msg *tgbotapi.M
 		}
 		sent := broadcast(bot, ids, text)
 		_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Sent to %d trial users.", sent)))
+	case "stat":
+		if !isAdmin(cfg, msg.From.ID) {
+			return
+		}
+		totalUsers, totalLinks, todayLinks, weekLinks, err := stats(db)
+		if err != nil {
+			_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Failed to load stats."))
+			return
+		}
+		statText := fmt.Sprintf(
+			"Users total: %d\nLinks today: %d\nLinks week: %d\nLinks total: %d",
+			totalUsers, todayLinks, weekLinks, totalLinks,
+		)
+		_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, statText))
+	case "setwelcome":
+		if !isAdmin(cfg, msg.From.ID) {
+			return
+		}
+		text := strings.TrimSpace(msg.CommandArguments())
+		if text == "" {
+			_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Usage: /setwelcome <text>"))
+			return
+		}
+		if err := setSetting(db, settingsKeyWelcome, text); err != nil {
+			_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Failed to update welcome message."))
+			return
+		}
+		_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Welcome message updated."))
+	case "setpay":
+		if !isAdmin(cfg, msg.From.ID) {
+			return
+		}
+		text := strings.TrimSpace(msg.CommandArguments())
+		if text == "" {
+			_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Usage: /setpay <text>"))
+			return
+		}
+		if err := setSetting(db, settingsKeyPayment, text); err != nil {
+			_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Failed to update payment message."))
+			return
+		}
+		_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Payment message updated."))
+	case "setlink":
+		if !isAdmin(cfg, msg.From.ID) {
+			return
+		}
+		text := strings.TrimSpace(msg.CommandArguments())
+		if text == "" {
+			_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Usage: /setlink <text>"))
+			return
+		}
+		if err := setSetting(db, settingsKeyLink, text); err != nil {
+			_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Failed to update link message."))
+			return
+		}
+		_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Link message updated."))
+	case "cleardb":
+		if !isAdmin(cfg, msg.From.ID) {
+			return
+		}
+		if err := clearTrials(db); err != nil {
+			_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Failed to clear trials."))
+			return
+		}
+		_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Trials cleared."))
+	case "debug":
+		if !isAdmin(cfg, msg.From.ID) {
+			return
+		}
+		arg := strings.TrimSpace(msg.CommandArguments())
+		if arg == "" {
+			_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Usage: /debug <user_id>"))
+			return
+		}
+		userID, err := strconv.ParseInt(arg, 10, 64)
+		if err != nil {
+			_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Invalid user_id."))
+			return
+		}
+		t, err := getTrial(db, userID)
+		if err != nil {
+			_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Failed to load trial: %v", err)))
+			return
+		}
+		status, statusErr := getChatMember(bot, cfg.ChannelID, userID)
+		if statusErr != nil {
+			status = fmt.Sprintf("error: %v", statusErr)
+		}
+		if t == nil {
+			_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Trial: none\nStatus: %s", status)))
+			return
+		}
+		debugText := fmt.Sprintf(
+			"Trial:\ninvite_created_at=%d\ninvite_expires_at=%d\ninvite_link=%s\ncooldown_until=%d\nstarted_at=%d\nends_at=%d\nended_at=%v\nStatus: %s",
+			t.InviteCreated, t.InviteExpires, t.InviteLink, t.CooldownUntil, t.StartedAt, t.EndsAt, t.EndedAt, status,
+		)
+		_, _ = bot.Send(tgbotapi.NewMessage(msg.Chat.ID, debugText))
 	default:
 		// ignore
 	}
@@ -290,46 +534,116 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, cfg Config, cq *tgbotapi.C
 		return
 	}
 
-	if cq.Data != "trial_start" {
-		return
-	}
+	switch cq.Data {
+	case "trial_start":
+		_ = upsertUser(db, cq.From)
 
-	_ = upsertUser(db, cq.From)
-	used, err := hasTrial(db, cq.From.ID)
-	if err != nil {
-		answer := tgbotapi.NewCallback(cq.ID, "Error. Try later.")
-		_, _ = bot.Request(answer)
-		return
-	}
+		now := time.Now().Unix()
+		t, err := getTrial(db, cq.From.ID)
+		if err != nil {
+			answer := tgbotapi.NewCallback(cq.ID, "Error. Try later.")
+			_, _ = bot.Request(answer)
+			return
+		}
 
-	if used {
-		answer := tgbotapi.NewCallback(cq.ID, "Free access is done. Continue for payment.")
+		if t != nil {
+			if t.EndedAt.Valid {
+				answer := tgbotapi.NewCallback(cq.ID, "Free access is done. Pay to continue.")
+				_, _ = bot.Request(answer)
+				msg := tgbotapi.NewMessage(cq.Message.Chat.ID, "Free access is done. Pay to continue.")
+				msg.ReplyMarkup = getAccessMarkup()
+				_, _ = bot.Send(msg)
+				return
+			}
+
+			if t.StartedAt > 0 {
+				remaining := time.Until(time.Unix(t.EndsAt, 0)).Round(time.Second)
+				answer := tgbotapi.NewCallback(cq.ID, "Trial is already active.")
+				_, _ = bot.Request(answer)
+				msg := tgbotapi.NewMessage(cq.Message.Chat.ID, fmt.Sprintf("Your trial is active. Remaining: %s", remaining))
+				_, _ = bot.Send(msg)
+				return
+			}
+
+			if t.CooldownUntil > 0 && now < t.CooldownUntil {
+				wait := time.Until(time.Unix(t.CooldownUntil, 0)).Round(time.Minute)
+				answer := tgbotapi.NewCallback(cq.ID, "Please wait before requesting a new link.")
+				_, _ = bot.Request(answer)
+				msg := tgbotapi.NewMessage(cq.Message.Chat.ID, fmt.Sprintf("You can request a new link in %s", wait))
+				_, _ = bot.Send(msg)
+				return
+			}
+		}
+
+		// If user is banned, unban before issuing link
+		status, err := getChatMember(bot, cfg.ChannelID, cq.From.ID)
+		if err == nil && status == "kicked" {
+			unban := tgbotapi.Params{
+				"chat_id":        strconv.FormatInt(cfg.ChannelID, 10),
+				"user_id":        strconv.FormatInt(cq.From.ID, 10),
+				"only_if_banned": "true",
+			}
+			_, _ = bot.MakeRequest("unbanChatMember", unban)
+		}
+
+		inviteExpires := time.Now().Add(inviteTTLMinutes * time.Minute)
+		cooldownUntil := time.Now().Add(inviteCooldownHours * time.Hour)
+		endsAt := time.Now().Add(time.Duration(cfg.TrialMinutes) * time.Minute)
+		if err := upsertTrialStarted(db, cq.From.ID, inviteExpires, cooldownUntil, endsAt); err != nil {
+			answer := tgbotapi.NewCallback(cq.ID, "Failed to start trial.")
+			_, _ = bot.Request(answer)
+			return
+		}
+
+		log.Printf("invite issued user=%d expires=%s", cq.From.ID, inviteExpires.Format(time.RFC3339))
+		log.Printf("trial started user=%d ends=%s", cq.From.ID, endsAt.Format(time.RFC3339))
+		sendLogToAdmins(bot, cfg, fmt.Sprintf("trial started user=%d ends=%s", cq.From.ID, endsAt.Format(time.RFC3339)))
+
+		invite, err := createInviteLink(bot, cfg.ChannelID, inviteExpires)
+		if err != nil {
+			log.Printf("create invite link failed: %v", err)
+			answer := tgbotapi.NewCallback(cq.ID, "Failed to create invite link.")
+			_, _ = bot.Request(answer)
+			return
+		}
+
+		_ = setInviteLink(db, cq.From.ID, invite)
+
+		answer := tgbotapi.NewCallback(cq.ID, "Invite sent.")
 		_, _ = bot.Request(answer)
-		msg := tgbotapi.NewMessage(cq.Message.Chat.ID, "Free access is done. Continue for payment.")
+
+		linkText, err := getSetting(db, settingsKeyLink, defaultLinkMessage)
+		if err != nil {
+			linkText = defaultLinkMessage
+		}
+		btn := tgbotapi.NewInlineKeyboardButtonURL("Open Channel", invite)
+		kb := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btn))
+		msg := tgbotapi.NewMessage(cq.Message.Chat.ID, linkText)
+		msg.ReplyMarkup = kb
 		_, _ = bot.Send(msg)
-		return
-	}
-
-	endsAt, err := createTrial(db, cq.From.ID, time.Duration(cfg.TrialMinutes)*time.Minute)
-	if err != nil {
-		answer := tgbotapi.NewCallback(cq.ID, "Failed to start trial.")
+	case "get_access":
+		answer := tgbotapi.NewCallback(cq.ID, "Payment info sent.")
 		_, _ = bot.Request(answer)
+		payText, err := getSetting(db, settingsKeyPayment, defaultPaymentMessage)
+		if err != nil {
+			payText = defaultPaymentMessage
+		}
+		_, _ = bot.Send(tgbotapi.NewMessage(cq.Message.Chat.ID, payText))
+	default:
 		return
 	}
+}
 
-	invite, err := createInviteLink(bot, cfg.ChannelID, time.Now().Add(10*time.Minute))
-	if err != nil {
-		log.Printf("create invite link failed: %v", err)
-		answer := tgbotapi.NewCallback(cq.ID, "Failed to create invite link.")
-		_, _ = bot.Request(answer)
-		return
+func getAccessMarkup() tgbotapi.InlineKeyboardMarkup {
+	btn := tgbotapi.NewInlineKeyboardButtonData("Get Access", "get_access")
+	return tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btn))
+}
+
+func sendLogToAdmins(bot *tgbotapi.BotAPI, cfg Config, text string) {
+	for id := range cfg.AdminIDs {
+		msg := tgbotapi.NewMessage(id, text)
+		_, _ = bot.Send(msg)
 	}
-
-	answer := tgbotapi.NewCallback(cq.ID, "Trial started.")
-	_, _ = bot.Request(answer)
-
-	text := fmt.Sprintf("Your free access is active until %s. Join via this link: %s", endsAt.Format(time.RFC1123), invite)
-	_, _ = bot.Send(tgbotapi.NewMessage(cq.Message.Chat.ID, text))
 }
 
 func createInviteLink(bot *tgbotapi.BotAPI, channelID int64, expires time.Time) (string, error) {
@@ -353,34 +667,91 @@ func createInviteLink(bot *tgbotapi.BotAPI, channelID int64, expires time.Time) 
 	return link.InviteLink, nil
 }
 
+func revokeInviteLink(bot *tgbotapi.BotAPI, channelID int64, link string) error {
+	if strings.TrimSpace(link) == "" {
+		return nil
+	}
+	params := tgbotapi.Params{
+		"chat_id":     strconv.FormatInt(channelID, 10),
+		"invite_link": link,
+	}
+	resp, err := bot.MakeRequest("revokeChatInviteLink", params)
+	if err != nil {
+		return err
+	}
+	if !resp.Ok {
+		return fmt.Errorf("telegram error: %s", resp.Description)
+	}
+	return nil
+}
+
+func getChatMember(bot *tgbotapi.BotAPI, channelID, userID int64) (string, error) {
+	params := tgbotapi.Params{
+		"chat_id": strconv.FormatInt(channelID, 10),
+		"user_id": strconv.FormatInt(userID, 10),
+	}
+	resp, err := bot.MakeRequest("getChatMember", params)
+	if err != nil {
+		return "", err
+	}
+	if !resp.Ok {
+		return "", fmt.Errorf("telegram error: %s", resp.Description)
+	}
+	var member tgbotapi.ChatMember
+	if err := json.Unmarshal(resp.Result, &member); err != nil {
+		return "", err
+	}
+	return member.Status, nil
+}
+
 func trialWorker(bot *tgbotapi.BotAPI, db *sql.DB, cfg Config) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		rows, err := db.Query(`SELECT user_id FROM trials WHERE ended_at IS NULL AND ends_at <= ?`, time.Now().Unix())
+		now := time.Now().Unix()
+
+		rows, err := db.Query(`SELECT user_id, invite_link FROM trials WHERE ended_at IS NULL AND started_at > 0 AND ends_at <= ?`, now)
 		if err != nil {
 			continue
 		}
 
 		var ids []int64
+		var links []string
 		for rows.Next() {
 			var id int64
-			if err := rows.Scan(&id); err == nil {
+			var link string
+			if err := rows.Scan(&id, &link); err == nil {
 				ids = append(ids, id)
+				links = append(links, link)
 			}
 		}
 		rows.Close()
 
-		for _, id := range ids {
-			params := tgbotapi.Params{
-				"chat_id":         strconv.FormatInt(cfg.ChannelID, 10),
-				"user_id":         strconv.FormatInt(id, 10),
-				"revoke_messages": "false",
-			}
-			_, _ = bot.MakeRequest("banChatMember", params)
+		for i, id := range ids {
+			_ = revokeInviteLink(bot, cfg.ChannelID, links[i])
 
+			status, err := getChatMember(bot, cfg.ChannelID, id)
+			if err == nil {
+				if status == "member" || status == "administrator" || status == "creator" {
+					params := tgbotapi.Params{
+						"chat_id":         strconv.FormatInt(cfg.ChannelID, 10),
+						"user_id":         strconv.FormatInt(id, 10),
+						"revoke_messages": "false",
+					}
+					_, _ = bot.MakeRequest("banChatMember", params)
+					unban := tgbotapi.Params{
+						"chat_id":        strconv.FormatInt(cfg.ChannelID, 10),
+						"user_id":        strconv.FormatInt(id, 10),
+						"only_if_banned": "true",
+					}
+					_, _ = bot.MakeRequest("unbanChatMember", unban)
+				}
+			}
+
+			log.Printf("trial ended user=%d", id)
 			msg := tgbotapi.NewMessage(id, "Your free access period is over.")
+			msg.ReplyMarkup = getAccessMarkup()
 			_, _ = bot.Send(msg)
 
 			_ = markTrialEnded(db, id)
@@ -402,4 +773,3 @@ func broadcast(bot *tgbotapi.BotAPI, ids []int64, text string) int {
 func isAdmin(cfg Config, userID int64) bool {
 	return cfg.AdminIDs[userID]
 }
-
